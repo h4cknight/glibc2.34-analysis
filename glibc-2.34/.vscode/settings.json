@@ -1,0 +1,6 @@
+{
+    "files.associations": {
+        "dynamic-link.h": "c",
+        "*.def": "cpp"
+    }
+}
