@@ -111,9 +111,9 @@ static bool __malloc_initialized = false;
    readily available, create a new one.  In this latter case, `size'
    is just a hint as to how much memory will be required immediately
    in the new arena. */
-//尝试获取arena并lock它
-//如果ptr指向的arena存在，则直接锁住它
-//如果不存在，则调用arena_get2：
+//获取arena并锁住它，通常用于多线程环境下
+//首先尝试通过__thread mstate thread_arena 获取；
+//如果没有获取到则通过arena_get2获取
 #define arena_get(ptr, size) do { \
       ptr = thread_arena;						      \
       arena_lock (ptr, size);						      \
@@ -129,7 +129,7 @@ static bool __malloc_initialized = false;
 /* find the heap and corresponding arena for a given ptr */
 
 #define heap_for_ptr(ptr) \
-  ((heap_info *) ((unsigned long) (ptr) & ~(HEAP_MAX_SIZE - 1)))//说明heap_info是一个vma（HEAP_MAX_SIZE对齐了）的起始地址；这么说可能不一定准确，若是两个堆段在一起，这就只有一个vma
+  ((heap_info *) ((unsigned long) (ptr) & ~(HEAP_MAX_SIZE - 1)))//说明heap_info是一个vma（HEAP_MAX_SIZE对齐了）的起始地址；这么说可能不一定准确，若是两个堆段在一起，且权限一致的话这就只有一个vma，当然了还是两个heap区域
 #define arena_for_chunk(ptr) \
   (chunk_main_arena (ptr) ? &main_arena : heap_for_ptr (ptr)->ar_ptr)//获取main arena的地址或者ptr所对应的heap_info中记录的ar_ptr，这种操作感觉表明了一个信息：同一个arena的所有heap_info的ar_ptr都相同
 
@@ -199,11 +199,11 @@ __malloc_fork_unlock_child (void)
         {
 	  /* This arena is no longer attached to any thread.  */
 	  ar_ptr->attached_threads = 0;
-          ar_ptr->next_free = free_list;
+          ar_ptr->next_free = free_list;//next_free仅仅包含freelist，next既包含free，也包含非free
           free_list = ar_ptr;
         }
       ar_ptr = ar_ptr->next;
-      if (ar_ptr == &main_arena)
+      if (ar_ptr == &main_arena)//说明绕了一圈了
         break;
     }
 
@@ -291,7 +291,7 @@ ptmalloc_init (void)
   //随机初始化tcache_key
   tcache_key_initialize ();
 #endif
-
+//global -g USE_MTAG 搜索，发现此宏和体系架构aarch64相关，暂不分析
 #ifdef USE_MTAG
   if ((TUNABLE_GET_FULL (glibc, mem, tagging, int32_t, NULL) & 1) != 0)
     {
@@ -314,10 +314,10 @@ ptmalloc_init (void)
   if (!__libc_initial)
     __always_fail_morecore = true;
 #endif
-  // Thread specific data.  定义时thread_arena有__thread 前缀，表明线程私有变量
-  //main_arena是一个静态全局变量
+  //Thread specific data.  定义时thread_arena有__thread 前缀，表明线程私有变量
+  //main_arena是一个libc.so的一个静态全局变量
   thread_arena = &main_arena;
-  //初始化arena
+  //这里初始化main_arena
   malloc_init_state (&main_arena);
   //初始化一些变量
 #if HAVE_TUNABLES
@@ -444,7 +444,7 @@ static char *aligned_heap_area;
 
 /* Create a new heap.  size is automatically rounded up to a multiple
    of the page size. */
-
+//size既包含申请大小，还包含了heap的元数据，top_pad作用是在顶部多预申请一些内存
 static heap_info *
 new_heap (size_t size, size_t top_pad)
 {
@@ -455,11 +455,11 @@ new_heap (size_t size, size_t top_pad)
 
   if (size + top_pad < HEAP_MIN_SIZE)//32K
     size = HEAP_MIN_SIZE;
-  else if (size + top_pad <= HEAP_MAX_SIZE)//32:1M   64:64M
+  else if (size + top_pad <= HEAP_MAX_SIZE)//32:1M   64:32\64M 通常是64M
     size += top_pad;
-  else if (size > HEAP_MAX_SIZE)
+  else if (size > HEAP_MAX_SIZE)//超过允许值，直接返回NULL
     return 0;
-  else
+  else//多预申请的内存不满足要求，size满足要求，直接申请最大值
     size = HEAP_MAX_SIZE;
   size = ALIGN_UP (size, pagesize);//对size进行页对齐
 
@@ -468,9 +468,11 @@ new_heap (size_t size, size_t top_pad)
      mapping (on Linux, this is the case for all non-writable mappings
      anyway). */
   p2 = MAP_FAILED;
-  if (aligned_heap_area)//这个变量主要用于减少虚拟地址空间碎片
+  if (aligned_heap_area)//这个变量主要用于减少虚拟地址空间碎片，表明偏向于两个连续的HEAP_MAX_SIZE挨着
     {
       //将aligned_heap_area作为hint，申请虚拟地址空间;
+      //__mmap((addr), (size), (prot), (flags)|MAP_ANONYMOUS|MAP_PRIVATE, -1, 0) 
+      //MAP_ANONYMOUS：The mapping is not backed by any file; its contents are initialized to zero. 匿名映射会被初始化为0
       p2 = (char *) MMAP (aligned_heap_area, HEAP_MAX_SIZE, PROT_NONE,
                           MAP_NORESERVE);
       aligned_heap_area = NULL;
@@ -482,12 +484,12 @@ new_heap (size_t size, size_t top_pad)
     }
   if (p2 == MAP_FAILED)
     {
-      //有内核随机分配，之后进行HEAP_MAX_SIZE对齐，为此将首尾多余的虚拟地址空间进行umap
+      //有内核随机分配，之后进行HEAP_MAX_SIZE对齐，为此将首尾多余的虚拟地址空间进行unmap      
       p1 = (char *) MMAP (0, HEAP_MAX_SIZE << 1, PROT_NONE, MAP_NORESERVE);
       if (p1 != MAP_FAILED)
         {
           p2 = (char *) (((unsigned long) p1 + (HEAP_MAX_SIZE - 1))
-                         & ~(HEAP_MAX_SIZE - 1));
+                         & ~(HEAP_MAX_SIZE - 1));//heap区域必定HEAP_MAX_SIZE
           ul = p2 - p1;
           if (ul)
             __munmap (p1, ul);
@@ -510,13 +512,15 @@ new_heap (size_t size, size_t top_pad)
             }
         }
     }
-  if (__mprotect (p2, size, mtag_mmap_flags | PROT_READ | PROT_WRITE) != 0)//mprotect改变指定地址空间范围内的权限，如果有必要的话，一个VMA 可能因此分裂成多个VMA ，不同VMA 设置不同权限
+    //mprotect改变指定地址空间范围内的权限，如果有必要的话，一个VMA 可能因此分裂成多个VMA ，不同VMA 设置不同权限
+    //虽然申请了HEAP_MAX_SIZE的空间，但是只有size范围内的heap允许读写，其它部分无法使用
+  if (__mprotect (p2, size, mtag_mmap_flags | PROT_READ | PROT_WRITE) != 0)
     {
       __munmap (p2, HEAP_MAX_SIZE);
       return 0;
     }
   h = (heap_info *) p2;
-  h->size = size;
+  h->size = size;//从这来看,size/mprotect_size都是真正最终可用的内存区域,包含元数据
   h->mprotect_size = size;
   LIBC_PROBE (memory_heap_new, 2, h, h->size);
   return h;
@@ -524,9 +528,10 @@ new_heap (size_t size, size_t top_pad)
 
 /* Grow a heap.  size is automatically rounded up to a
    multiple of the page size. */
-
+//没有mmap新的region，只是将之前不可读写的区域变成可读写，没有mmap新的region
+//如果增长会超过HEAP_MAX_SIZE，则放弃增长返回-1；通常增长发生在topchunk空间不够使用
 static int
-grow_heap (heap_info *h, long diff)//只是尝试扩展heap，没有mmap新的region
+grow_heap (heap_info *h, long diff)
 {
   size_t pagesize = GLRO (dl_pagesize);
   long new_size;
@@ -554,12 +559,12 @@ grow_heap (heap_info *h, long diff)//只是尝试扩展heap，没有mmap新的re
 /* Shrink a heap.  */
 
 static int
-shrink_heap (heap_info *h, long diff)
+shrink_heap (heap_info *h, long diff)//diff为预期的缩减字节
 {
   long new_size;
 
   new_size = (long) h->size - diff;//收缩后大小
-  if (new_size < (long) sizeof (*h))//收缩后的大小不能小于heap结构的大小
+  if (new_size < (long) sizeof (*h))//收缩后的剩余大小不能小于heap结构的大小
     return -1;
 
   /* Try to re-map the extra heap space freshly to save memory, and make it
@@ -599,7 +604,7 @@ heap_trim (heap_info *heap, size_t pad)
   mchunkptr top_chunk = top (ar_ptr), p;
   heap_info *prev_heap;
   long new_size, top_size, top_area, extra, prev_size, misalign;
-
+  //从后往前，依次判断整个heap能否delete，能删除就删，遇到第一个不能删除就break
   /* Can this heap go away completely? */
   while (top_chunk == chunk_at_offset (heap, sizeof (*heap)))//为真说明topchunk为唯一的chunk,并且不是含有arena的heap,必然有prev_heap
     {
@@ -639,6 +644,7 @@ heap_trim (heap_info *heap, size_t pad)
   /* Uses similar logic for per-thread arenas as the main arena with systrim
      and _int_free by preserving the top pad and rounding down to the nearest
      page.  */
+  //接下来的处理就类似main arena中topchunk的缩减过程了
   top_size = chunksize (top_chunk);
   if ((unsigned long)(top_size) <
       (unsigned long)(mp_.trim_threshold))//没有到收缩的阈值，直接返回
@@ -685,7 +691,9 @@ detach_arena (mstate replaced_arena)
       --replaced_arena->attached_threads;
     }
 }
-
+//这里新建的arena都是非main_arena,申请成功后会加入next链表；
+//size是一个hint告诉新建的arena的空间要能容下size
+//但不是绝对，如果一个heap装不下，那么会新建一个最小的能容下元数据并满足相关对齐要求的arena及其附属的heap
 static mstate
 _int_new_arena (size_t size)
 {
@@ -695,10 +703,11 @@ _int_new_arena (size_t size)
   unsigned long misalign;
   //sizeof(*h)等同于sizeof(heap_info)获取heap_info结构的大小
   //Create a new heap.这里很明显将mmap出来 的start地址作为heap_info的收地址
+  //new heap区域被mmap匿名映射出来时区域中的值都初始化为0，因而arena中fastbin等都为0，其他值需要后续进一步设置
   h = new_heap (size + (sizeof (*h) + sizeof (*a) + MALLOC_ALIGNMENT),
                 mp_.top_pad);
   if (!h)
-    {
+    {//申请大小可能太大了，不能再一个heap放下，那么就考虑让后面_int_malloc来处理，先申请一个不包含申请内存的最小的heap
       /* Maybe size is too large to fit in a single heap.  So, just try
          to create a minimally-sized arena and let _int_malloc() attempt
          to deal with the large request via mmap_chunk().  */
@@ -708,21 +717,21 @@ _int_new_arena (size_t size)
     }
     //将arena设置为紧挨着heap_info位置的地方
   a = h->ar_ptr = (mstate) (h + 1);
-  malloc_init_state (a);
+  malloc_init_state (a);//初始化arena
   a->attached_threads = 1;
   /*a->next = NULL;*/
-  a->system_mem = a->max_system_mem = h->size;/* Memory allocated from the system in this arena.  */
+  a->system_mem = a->max_system_mem = h->size;/* mmap且读写区域的大小，h->size页对齐  */
 
   /* Set up the top chunk, with proper alignment. */
   ptr = (char *) (a + 1);
   misalign = (unsigned long) chunk2mem (ptr) & MALLOC_ALIGN_MASK;
   if (misalign > 0)
     ptr += MALLOC_ALIGNMENT - misalign;//修正ptr，让ptr对齐MALLOC_ALIGNMENT
-  top (a) = (mchunkptr) ptr;//设置arena的top
-  set_head (top (a), (((char *) h + h->size) - ptr) | PREV_INUSE);//初始化top_chunk并且设置PREV_INUSE
+  top (a) = (mchunkptr) ptr;//设置arena的top,top尾部页对齐
+  set_head (top (a), (((char *) h + h->size) - ptr) | PREV_INUSE);//初始化top_chunk的mchunk_size并且设置PREV_INUSE
 
   LIBC_PROBE (memory_arena_new, 2, a, size);
-  mstate replaced_arena = thread_arena;
+  mstate replaced_arena = thread_arena;//从这开始后面的操作基本上就是将新创建的arena加入next链表
   thread_arena = a;
   __libc_lock_init (a->mutex);
 
@@ -759,8 +768,10 @@ _int_new_arena (size_t size)
 
 
 /* Remove an arena from free_list.  */
-//默认有一个arena free list，可以从里面获取一个free arena，并从free list列表中移除;暂时不清楚free list哪来的，但是不影响理解
-//
+//默认有一个arena free list，可以从里面获取一个free arena，并从free list列表中移除;
+//在多线程环境中某个父线程fork后，父子线程刚开始时共享内存空间，但只有被fork的线程的arena会被使用，其它的在子线程中不会被使用了，所以将他们放入了freelist
+//类似的还有线程栈，只有当前线程栈还会被使用，其它的线程栈就不再会使用了，这些线程栈的空间也要被回收
+//这些操作发生在glibc的fork方法（不是系统调用）
 static mstate
 get_free_list (void)
 {
@@ -919,14 +930,14 @@ arena_get2 (size_t size, mstate avoid_arena)
         {
           if (catomic_compare_and_exchange_bool_acq (&narenas, n + 1, n))//CAS 如果计数成功，则返回false，进入_int_new_arena
             goto repeat;
-          a = _int_new_arena (size);//新申请一个arena并加入全局list
+          a = _int_new_arena (size);//这里新建的arena都是非main_arena,申请成功后会加入next链表
 	  if (__glibc_unlikely (a == NULL))
             catomic_decrement (&narenas);//申请失败，则退回计数
         }
       else
       /* Lock and return an arena that can be reused for memory allocation.
          Avoid AVOID_ARENA as we have already failed to allocate memory in  it and it is currently locked.  */
-        a = reused_arena (avoid_arena);//简单理解就是遍历arena,获取第一个next能使用的arena，实际上有平衡arean-thread以及竞争处理
+        a = reused_arena (avoid_arena);//简单理解就是遍历arena,获取第一个next能使用的arena，如果遇到的第一个是avoid_arena，则返回avoid_arena.next
     }
   return a;
 }
@@ -935,6 +946,7 @@ arena_get2 (size_t size, mstate avoid_arena)
    out of mmapped areas, so we can try allocating on the main arena.
    Otherwise, it is likely that sbrk() has failed and there is still a chance
    to mmap(), so try one of the other arenas.  */
+   
 static mstate
 arena_get_retry (mstate ar_ptr, size_t bytes)
 {
