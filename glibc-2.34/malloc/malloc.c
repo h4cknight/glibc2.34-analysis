@@ -1677,7 +1677,7 @@ unlink_chunk (mstate av, mchunkptr p)
 	    fd->fd_nextsize = fd->bk_nextsize = fd;
 	  else
 	    {
-	      fd->fd_nextsize = p->fd_nextsize;
+	      fd->fd_nextsize = p->fd_nextsize;//fd应该是同大小的large chunk组中的第一个了
 	      fd->bk_nextsize = p->bk_nextsize;
 	      p->fd_nextsize->bk_nextsize = fd;
 	      p->bk_nextsize->fd_nextsize = fd;
